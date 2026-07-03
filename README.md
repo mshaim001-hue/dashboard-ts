@@ -7,7 +7,7 @@ Go backend шлёт heartbeat напрямую в API школы, решает c
 ## Возможности
 
 - **Heartbeat каждые 30 сек** — `idle: false` по умолчанию (можно работать с ноута, не трогая мышь Mac)
-- **Несколько аккаунтов** — свой + друзья из одного приложения, каждый со своим fingerprint и deviceId
+- **Несколько аккаунтов** — у каждого свой `deviceId`, виртуальный **hostname** (`E3-XX`) и fingerprint в heartbeat
 - **Captcha** — автоматически на macOS (Vision OCR)
 - **Agent pair** — локальный сервер на `:47836` (или использует школьный agent, если порт занят)
 - **Вход через Chrome** — только на минуту для Gitea OAuth, для учёта браузер не нужен
@@ -55,12 +55,19 @@ UI будет на http://localhost:8080
 ```
 ~/.ts-tracker/
 ├── ts-tracker.log          # логи
-├── device_id               # machineId для agent pair
+├── device_id               # legacy (локальный agent :47836)
 └── accounts/
     └── {login}/
-        ├── account.json    # cookies, deviceId
-        └── fingerprint-v2  # fingerprint на аккаунт
+        ├── account.json    # cookies, deviceId, hostname
+        ├── device_id       # UUID для heartbeat
+        └── fingerprint-v3  # fingerprint под виртуальный hostname
 ```
+
+**Agent pair** — всегда реальный Mac через школьный agent на `:47836` (serial из инвентаря + токен).
+
+**Heartbeat** — у каждого аккаунта свой виртуальный hostname `E3-01`…`E3-99` (deviceName + fingerprint).
+
+При добавлении аккаунта hostname генерируется автоматически. Старые аккаунты получают его при первом запуске после обновления.
 
 ## Флаги backend
 

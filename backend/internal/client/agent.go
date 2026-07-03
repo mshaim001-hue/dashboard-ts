@@ -22,27 +22,11 @@ type pairInfo struct {
 }
 
 func (d *Dashboard) PairAgent() error {
-	slog.Info("agent pair: fetching pair-info", "url", agentInfoURL)
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(agentInfoURL)
-	if err != nil {
-		slog.Error("agent pair: pair-info unreachable", "error", err)
-		return fmt.Errorf("агент на :47836 недоступен: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("pair-info: HTTP %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
+	// Pair always uses the real campus agent on :47836 (inventory-checked serial + token).
+	// Virtual hostname is heartbeat-only.
+	info, err := fetchLocalPairInfo()
 	if err != nil {
 		return err
-	}
-	var info pairInfo
-	if err := json.Unmarshal(body, &info); err != nil {
-		return err
-	}
-	if info.MachineID == "" {
-		return fmt.Errorf("pair-info: пустой machineId")
 	}
 	token := info.Token
 	if token == "" {
@@ -60,14 +44,43 @@ func (d *Dashboard) PairAgent() error {
 	return nil
 }
 
-// Fingerprint returns a stable browser-like device fingerprint.
-func Fingerprint(dataDir, login string) string {
-	path := filepath.Join(dataDir, "fingerprint-v2")
+func fetchLocalPairInfo() (*pairInfo, error) {
+	slog.Info("agent pair: fetching pair-info", "url", agentInfoURL)
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(agentInfoURL)
+	if err != nil {
+		slog.Error("agent pair: pair-info unreachable", "error", err)
+		return nil, fmt.Errorf("агент на :47836 недоступен: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("pair-info: HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var info pairInfo
+	if err := json.Unmarshal(body, &info); err != nil {
+		return nil, err
+	}
+	if info.MachineID == "" {
+		return nil, fmt.Errorf("pair-info: пустой machineId")
+	}
+	return &info, nil
+}
+
+// Fingerprint returns a stable browser-like device fingerprint for virtualHostname.
+func Fingerprint(dataDir, login, virtualHostname string) string {
+	path := filepath.Join(dataDir, "fingerprint-v3")
 	if b, err := os.ReadFile(path); err == nil && len(b) == 64 {
 		return string(b)
 	}
 
-	hostname, _ := os.Hostname()
+	hostname := virtualHostname
+	if hostname == "" {
+		hostname, _ = os.Hostname()
+	}
 	ua := "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 	canvas := "tomorrow-school-canvas-v1"
 	parts := []string{

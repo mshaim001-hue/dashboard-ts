@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zutemiss/dashboard-tracker/internal/client"
+	"github.com/zutemiss/dashboard-tracker/internal/device"
 	"github.com/zutemiss/dashboard-tracker/internal/tracking"
 )
 
@@ -25,6 +26,7 @@ type Account struct {
 	SessionActive    bool   `json:"sessionActive"`
 	StartedAt        string `json:"startedAt,omitempty"`
 	ChallengePending bool   `json:"challengePending"`
+	VirtualHostname  string `json:"virtualHostname,omitempty"`
 
 	client  *client.Dashboard
 	tracker *tracking.Tracker
@@ -41,6 +43,7 @@ type Manager struct {
 type accountState struct {
 	login       string
 	displayName string
+	hostname    string
 	client      *client.Dashboard
 	tracker     *tracking.Tracker
 	dir         string
@@ -53,6 +56,7 @@ type storedAccount struct {
 	Login       string         `json:"login"`
 	DisplayName string         `json:"displayName"`
 	DeviceID    string         `json:"deviceId"`
+	Hostname    string         `json:"hostname,omitempty"`
 	Cookies     []cookieRecord `json:"cookies"`
 }
 
@@ -77,6 +81,8 @@ func (m *Manager) loadAll() {
 		m.migrateOldCookies()
 		return
 	}
+
+	var stored []storedAccount
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -90,13 +96,27 @@ func (m *Manager) loadAll() {
 		if json.Unmarshal(b, &sa) != nil || sa.Login == "" {
 			continue
 		}
-		st := m.buildState(sa)
-		m.byLogin[sa.Login] = st
-		if m.active == "" {
-			m.active = sa.Login
-		}
-		slog.Info("account loaded", "login", sa.Login)
+		stored = append(stored, sa)
 	}
+
+	usedHosts := make(map[string]bool)
+	for i := range stored {
+		migrated := m.ensureStoredHostname(&stored[i], usedHosts)
+		st := m.buildState(stored[i])
+		m.byLogin[stored[i].Login] = st
+		if m.active == "" {
+			m.active = stored[i].Login
+		}
+		if migrated {
+			if err := m.saveAccount(st, cookiesFromStored(stored[i])); err != nil {
+				slog.Warn("save migrated hostname failed", "login", stored[i].Login, "error", err)
+			} else {
+				slog.Info("virtual hostname assigned", "login", stored[i].Login, "hostname", st.hostname)
+			}
+		}
+		slog.Info("account loaded", "login", stored[i].Login, "hostname", st.hostname)
+	}
+
 	if len(m.byLogin) == 0 {
 		m.migrateOldCookies()
 	}
@@ -126,9 +146,8 @@ func (m *Manager) migrateOldCookies() {
 
 func (m *Manager) buildState(sa storedAccount) *accountState {
 	acctDir := filepath.Join(m.dataDir, "accounts", sa.Login)
-	fp := client.Fingerprint(acctDir, sa.Login)
-	hostname, _ := os.Hostname()
-	c := client.New(sa.DeviceID, hostname+" · ts-tracker", fp)
+	fp := client.Fingerprint(acctDir, sa.Login, sa.Hostname)
+	c := client.New(sa.DeviceID, device.DeviceName(sa.Hostname), fp)
 	var cookies []*http.Cookie
 	for _, r := range sa.Cookies {
 		cookies = append(cookies, &http.Cookie{Name: r.Name, Value: r.Value})
@@ -140,6 +159,7 @@ func (m *Manager) buildState(sa storedAccount) *accountState {
 	return &accountState{
 		login:       sa.Login,
 		displayName: sa.DisplayName,
+		hostname:    sa.Hostname,
 		client:      c,
 		tracker:     tracking.New(c),
 		dir:         acctDir,
@@ -149,9 +169,8 @@ func (m *Manager) buildState(sa storedAccount) *accountState {
 func (m *Manager) AddFromCookies(cookies []*http.Cookie) (*Account, error) {
 	tmpDir := filepath.Join(m.dataDir, "_tmp_auth")
 	_ = os.MkdirAll(tmpDir, 0o700)
-	fp := client.Fingerprint(tmpDir, "")
-	hostname, _ := os.Hostname()
-	c := client.New(generateUUID(), hostname+" · ts-tracker", fp)
+	fp := client.Fingerprint(tmpDir, "", "tmp")
+	c := client.New(generateUUID(), device.DeviceName("tmp"), fp)
 	c.ImportCookies(client.BaseURL, cookies)
 
 	me, err := c.AuthMe()
@@ -166,13 +185,16 @@ func (m *Manager) AddFromCookies(cookies []*http.Cookie) (*Account, error) {
 	deviceIDPath := filepath.Join(acctDir, "device_id")
 	deviceID := loadOrCreateID(deviceIDPath)
 
-	fp = client.Fingerprint(acctDir, login)
-	c = client.New(deviceID, hostname+" · ts-tracker", fp)
+	hostname := m.loadOrGenerateHostname(acctDir)
+
+	fp = client.Fingerprint(acctDir, login, hostname)
+	c = client.New(deviceID, device.DeviceName(hostname), fp)
 	c.ImportCookies(client.BaseURL, cookies)
 
 	st := &accountState{
 		login:       login,
 		displayName: me.User.DisplayName,
+		hostname:    hostname,
 		client:      c,
 		tracker:     tracking.New(c),
 		dir:         acctDir,
@@ -187,7 +209,7 @@ func (m *Manager) AddFromCookies(cookies []*http.Cookie) (*Account, error) {
 	m.active = login
 	m.mu.Unlock()
 
-	slog.Info("account added", "login", login)
+	slog.Info("account added", "login", login, "hostname", hostname)
 	return m.snapshot(st), nil
 }
 
@@ -200,6 +222,7 @@ func (m *Manager) saveAccount(st *accountState, cookies []*http.Cookie) error {
 		Login:       st.login,
 		DisplayName: st.displayName,
 		DeviceID:    st.client.DeviceID(),
+		Hostname:    st.hostname,
 		Cookies:     records,
 	}
 	b, err := json.MarshalIndent(sa, "", "  ")
@@ -300,11 +323,12 @@ func (m *Manager) StopTracking(login string) {
 
 func (m *Manager) snapshot(st *accountState) *Account {
 	ac := &Account{
-		Login:       st.login,
-		DisplayName: st.displayName,
-		Tracking:    st.tracker.IsRunning(),
-		LastError:   st.tracker.LastError(),
-		Stalled:     st.stalled,
+		Login:           st.login,
+		DisplayName:     st.displayName,
+		Tracking:        st.tracker.IsRunning(),
+		LastError:       st.tracker.LastError(),
+		Stalled:         st.stalled,
+		VirtualHostname: st.hostname,
 	}
 	if dash, err := st.client.Dashboard(); err == nil {
 		ac.TodaySeconds = dash.Hours.TodaySeconds
@@ -332,6 +356,48 @@ func (m *Manager) snapshot(st *accountState) *Account {
 
 func (m *Manager) ImportCookiesToActive(cookies []*http.Cookie) (*Account, error) {
 	return m.AddFromCookies(cookies)
+}
+
+func (m *Manager) ensureStoredHostname(sa *storedAccount, usedHosts map[string]bool) bool {
+	if sa.Hostname != "" {
+		usedHosts[sa.Hostname] = true
+		return false
+	}
+	sa.Hostname = device.UniqueHostname(usedHosts)
+	usedHosts[sa.Hostname] = true
+	return true
+}
+
+func (m *Manager) loadOrGenerateHostname(acctDir string) string {
+	path := filepath.Join(acctDir, "account.json")
+	if b, err := os.ReadFile(path); err == nil {
+		var sa storedAccount
+		if json.Unmarshal(b, &sa) == nil && sa.Hostname != "" {
+			return sa.Hostname
+		}
+	}
+	usedH := m.usedHostnames()
+	return device.UniqueHostname(usedH)
+}
+
+func (m *Manager) usedHostnames() map[string]bool {
+	hosts := make(map[string]bool)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, st := range m.byLogin {
+		if st.hostname != "" {
+			hosts[st.hostname] = true
+		}
+	}
+	return hosts
+}
+
+func cookiesFromStored(sa storedAccount) []*http.Cookie {
+	var cookies []*http.Cookie
+	for _, r := range sa.Cookies {
+		cookies = append(cookies, &http.Cookie{Name: r.Name, Value: r.Value})
+	}
+	return cookies
 }
 
 func loadOrCreateID(path string) string {

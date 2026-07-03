@@ -269,7 +269,8 @@ export default function App() {
               <h3>Аккаунты ({status.accounts.length})</h3>
               <p className="muted" style={{ marginBottom: 12 }}>
                 Старт/Стоп — учёт для каждого отдельно, работают параллельно.
-                «Смотреть» — переключить карточки сверху на этого человека.
+                У каждого аккаунта свой виртуальный Mac (E3-XX). «Смотреть» —
+                переключить карточки сверху.
               </p>
               {status.accounts.map((a: Account) => {
                 const isActive = status.user?.login === a.login;
@@ -279,6 +280,8 @@ export default function App() {
                     <strong>{a.displayName}</strong>
                     <span className="muted"> @{a.login}</span>
                     <div className="muted" style={{ fontSize: "0.8rem" }}>
+                      {a.virtualHostname ? `Mac ${a.virtualHostname}` : ""}
+                      {a.virtualHostname ? " · " : ""}
                       сегодня {formatHours(a.todaySeconds)}
                       {a.tracking ? " · учёт идёт" : ""}
                       {a.stalled ? " · ⚠️ не растёт" : ""}

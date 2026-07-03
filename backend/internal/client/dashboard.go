@@ -36,8 +36,8 @@ func New(deviceID, deviceName, fingerprint string) *Dashboard {
 			Jar:     jar,
 			Timeout: 30 * time.Second,
 		},
-		deviceID:   deviceID,
-		deviceName: deviceName,
+		deviceID:    deviceID,
+		deviceName:  deviceName,
 		fingerprint: fp,
 	}
 }
@@ -300,4 +300,8 @@ func (d *Dashboard) IsAuthenticated() bool {
 
 func (d *Dashboard) DeviceID() string {
 	return d.deviceID
+}
+
+func (d *Dashboard) DeviceName() string {
+	return d.deviceName
 }

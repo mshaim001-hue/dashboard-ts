@@ -7,6 +7,7 @@ export type Account = {
   weekSeconds: number;
   stalled?: boolean;
   lastError?: string;
+  virtualHostname?: string;
 };
 
 export type Status = {
