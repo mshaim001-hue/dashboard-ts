@@ -254,8 +254,7 @@ export default function App() {
 
           {status.stalled && (
             <div className="alert alert--error">
-              ⚠️ Время не растёт 4+ мин — проверь Wi-Fi, captcha, idle (экран
-              заблокирован &gt; 60 сек не считается).
+              ⚠️ Время не растёт 4+ мин — проверь Wi-Fi, captcha, сессию.
             </div>
           )}
 
@@ -405,8 +404,8 @@ export default function App() {
                 школы.
               </li>
               <li>
-                <strong>Idle</strong>: если экран заблокирован &gt; 60 сек — время
-                не капает (как в dashboard).
+                По умолчанию всегда <strong>active</strong> — не нужно трогать
+                мышь Mac. Школьный idle только с флагом <code>-detect-idle</code>.
               </li>
               <li>
                 <strong>Captcha</strong> — решается автоматически (macOS Vision).

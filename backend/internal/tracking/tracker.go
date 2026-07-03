@@ -107,7 +107,7 @@ func (t *Tracker) loop(ctx context.Context) {
 }
 
 func (t *Tracker) beat() {
-	isIdle := idle.IsIdle(60 * time.Second)
+	isIdle := idle.ForHeartbeat()
 	resp, err := t.client.Heartbeat(isIdle)
 	if err != nil && client.IsDeviceConflict(err) {
 		slog.Warn("device conflict — taking over from Chrome/another tab")
