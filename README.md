@@ -6,7 +6,7 @@ Go backend шлёт heartbeat напрямую в API школы, решает c
 
 ## Возможности
 
-- **Heartbeat каждые 30 сек** — `idle: false` по умолчанию (можно работать с ноута, не трогая мышь Mac)
+- **Heartbeat каждые 30 сек** — `idle: false` по умолчанию
 - **Несколько аккаунтов** — у каждого свой `deviceId`, виртуальный **hostname** (`E3-XX`) и fingerprint в heartbeat
 - **Captcha** — автоматически на macOS (Vision OCR)
 - **Agent pair** — локальный сервер на `:47836` (или использует школьный agent, если порт занят)
