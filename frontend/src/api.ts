@@ -1,3 +1,11 @@
+export type WeekSchedule = {
+  mon: number;
+  tue: number;
+  wed: number;
+  thu: number;
+  fri: number;
+};
+
 export type Account = {
   login: string;
   displayName: string;
@@ -8,12 +16,17 @@ export type Account = {
   stalled?: boolean;
   lastError?: string;
   virtualHostname?: string;
+  schedule?: WeekSchedule;
+  quotaTodaySeconds?: number;
+  quotaReached?: boolean;
 };
 
 export type Status = {
   authenticated: boolean;
   user?: { login: string; displayName: string };
   mode?: string;
+  trackingMode?: "manual" | "schedule";
+  weekHours?: number;
   trackerRunning?: boolean;
   stalled?: boolean;
   lastError?: string;
@@ -110,6 +123,35 @@ export async function stopTracking(login?: string): Promise<void> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(login ? { login } : {}),
   });
+}
+
+export async function setTrackingMode(
+  mode: "manual" | "schedule",
+  weekHours?: number
+): Promise<void> {
+  const res = await fetch(`${API}/mode`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode, weekHours }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error ?? "Не удалось сменить режим");
+  }
+}
+
+export async function distributeSchedule(weekHours?: number): Promise<Account[]> {
+  const res = await fetch(`${API}/schedule/distribute`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(weekHours ? { weekHours } : {}),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error ?? "Не удалось распределить график");
+  }
+  const data = await res.json();
+  return data.accounts ?? [];
 }
 
 export async function fetchLogs(): Promise<{ logFile: string; lines: string[] }> {

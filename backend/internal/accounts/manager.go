@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -15,18 +16,26 @@ import (
 	"github.com/zutemiss/dashboard-tracker/internal/tracking"
 )
 
+const (
+	ModeManual   = "manual"
+	ModeSchedule = "schedule"
+)
+
 type Account struct {
-	Login            string `json:"login"`
-	DisplayName      string `json:"displayName"`
-	Tracking         bool   `json:"tracking"`
-	LastError        string `json:"lastError,omitempty"`
-	Stalled          bool   `json:"stalled"`
-	TodaySeconds     int    `json:"todaySeconds"`
-	WeekSeconds      int    `json:"weekSeconds"`
-	SessionActive    bool   `json:"sessionActive"`
-	StartedAt        string `json:"startedAt,omitempty"`
-	ChallengePending bool   `json:"challengePending"`
-	VirtualHostname  string `json:"virtualHostname,omitempty"`
+	Login             string        `json:"login"`
+	DisplayName       string        `json:"displayName"`
+	Tracking          bool          `json:"tracking"`
+	LastError         string        `json:"lastError,omitempty"`
+	Stalled           bool          `json:"stalled"`
+	TodaySeconds      int           `json:"todaySeconds"`
+	WeekSeconds       int           `json:"weekSeconds"`
+	SessionActive     bool          `json:"sessionActive"`
+	StartedAt         string        `json:"startedAt,omitempty"`
+	ChallengePending  bool          `json:"challengePending"`
+	VirtualHostname   string        `json:"virtualHostname,omitempty"`
+	Schedule          *WeekSchedule `json:"schedule,omitempty"`
+	QuotaTodaySeconds int           `json:"quotaTodaySeconds,omitempty"`
+	QuotaReached      bool          `json:"quotaReached,omitempty"`
 
 	client  *client.Dashboard
 	tracker *tracking.Tracker
@@ -34,10 +43,12 @@ type Account struct {
 }
 
 type Manager struct {
-	mu      sync.RWMutex
-	dataDir string
-	byLogin map[string]*accountState
-	active  string
+	mu        sync.RWMutex
+	dataDir   string
+	byLogin   map[string]*accountState
+	active    string
+	mode      string
+	weekHours float64
 }
 
 type accountState struct {
@@ -50,6 +61,7 @@ type accountState struct {
 	lastToday   int
 	lastTodayAt time.Time
 	stalled     bool
+	schedule    WeekSchedule
 }
 
 type storedAccount struct {
@@ -58,6 +70,12 @@ type storedAccount struct {
 	DeviceID    string         `json:"deviceId"`
 	Hostname    string         `json:"hostname,omitempty"`
 	Cookies     []cookieRecord `json:"cookies"`
+	Schedule    *WeekSchedule  `json:"schedule,omitempty"`
+}
+
+type settingsFile struct {
+	Mode      string  `json:"mode"`
+	WeekHours float64 `json:"weekHours"`
 }
 
 type cookieRecord struct {
@@ -67,9 +85,12 @@ type cookieRecord struct {
 
 func NewManager(dataDir string) *Manager {
 	m := &Manager{
-		dataDir: dataDir,
-		byLogin: make(map[string]*accountState),
+		dataDir:   dataDir,
+		byLogin:   make(map[string]*accountState),
+		mode:      ModeManual,
+		weekHours: 20,
 	}
+	m.loadSettings()
 	m.loadAll()
 	return m
 }
@@ -156,7 +177,7 @@ func (m *Manager) buildState(sa storedAccount) *accountState {
 	if _, err := c.AuthMe(); err != nil {
 		slog.Warn("account csrf refresh failed", "login", sa.Login, "error", err)
 	}
-	return &accountState{
+	st := &accountState{
 		login:       sa.Login,
 		displayName: sa.DisplayName,
 		hostname:    sa.Hostname,
@@ -164,6 +185,10 @@ func (m *Manager) buildState(sa storedAccount) *accountState {
 		tracker:     tracking.New(c),
 		dir:         acctDir,
 	}
+	if sa.Schedule != nil {
+		st.schedule = *sa.Schedule
+	}
+	return st
 }
 
 func (m *Manager) AddFromCookies(cookies []*http.Cookie) (*Account, error) {
@@ -210,7 +235,7 @@ func (m *Manager) AddFromCookies(cookies []*http.Cookie) (*Account, error) {
 	m.mu.Unlock()
 
 	slog.Info("account added", "login", login, "hostname", hostname)
-	return m.snapshot(st), nil
+	return m.snapshot(st, m.Mode()), nil
 }
 
 func (m *Manager) saveAccount(st *accountState, cookies []*http.Cookie) error {
@@ -225,6 +250,10 @@ func (m *Manager) saveAccount(st *accountState, cookies []*http.Cookie) error {
 		Hostname:    st.hostname,
 		Cookies:     records,
 	}
+	if !st.schedule.IsEmpty() {
+		sch := st.schedule
+		sa.Schedule = &sch
+	}
 	b, err := json.MarshalIndent(sa, "", "  ")
 	if err != nil {
 		return err
@@ -232,12 +261,162 @@ func (m *Manager) saveAccount(st *accountState, cookies []*http.Cookie) error {
 	return os.WriteFile(filepath.Join(st.dir, "account.json"), b, 0o600)
 }
 
-func (m *Manager) List() []*Account {
+func (m *Manager) Mode() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	out := make([]*Account, 0, len(m.byLogin))
+	return m.mode
+}
+
+func (m *Manager) WeekHours() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.weekHours
+}
+
+func (m *Manager) SetMode(mode string) error {
+	if mode != ModeManual && mode != ModeSchedule {
+		return fmt.Errorf("режим должен быть manual или schedule")
+	}
+	m.mu.Lock()
+	m.mode = mode
+	m.mu.Unlock()
+	if err := m.saveSettings(); err != nil {
+		return err
+	}
+	// В ручном режиме снимаем лимиты у всех трекеров.
+	if mode == ModeManual {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		for _, st := range m.byLogin {
+			st.tracker.SetDailyQuota(0)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) SetWeekHours(h float64) error {
+	if h < 1 || h > 60 {
+		return fmt.Errorf("недельная цель должна быть от 1 до 60 часов")
+	}
+	m.mu.Lock()
+	m.weekHours = h
+	m.mu.Unlock()
+	return m.saveSettings()
+}
+
+// DistributeSchedule раздаёт разный Пн–Пт график всем аккаунтам.
+func (m *Manager) DistributeSchedule(weekHours float64) error {
+	if weekHours <= 0 {
+		m.mu.RLock()
+		weekHours = m.weekHours
+		m.mu.RUnlock()
+	}
+	if weekHours < 1 {
+		weekHours = 20
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	logins := make([]string, 0, len(m.byLogin))
+	for login := range m.byLogin {
+		logins = append(logins, login)
+	}
+	if len(logins) == 0 {
+		return fmt.Errorf("нет аккаунтов")
+	}
+	// Стабильный порядок, чтобы seedIndex был предсказуемым при повторных вызовах.
+	sort.Strings(logins)
+
+	m.weekHours = weekHours
+	m.mode = ModeSchedule
+
+	for i, login := range logins {
+		st := m.byLogin[login]
+		st.schedule = generateSchedule(weekHours, i)
+		cookies := m.readCookies(st)
+		if err := m.saveAccount(st, cookies); err != nil {
+			return fmt.Errorf("%s: %w", login, err)
+		}
+		// Если уже крутится — обновить квоту на сегодня.
+		if st.tracker.IsRunning() {
+			st.tracker.SetDailyQuota(st.schedule.TodaySeconds(time.Now()))
+		}
+		slog.Info("schedule assigned",
+			"login", login,
+			"week", st.schedule.WeekTotal(),
+			"mon", st.schedule.Mon,
+			"tue", st.schedule.Tue,
+			"wed", st.schedule.Wed,
+			"thu", st.schedule.Thu,
+			"fri", st.schedule.Fri,
+		)
+	}
+
+	if err := m.saveSettingsLocked(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) readCookies(st *accountState) []*http.Cookie {
+	path := filepath.Join(st.dir, "account.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var sa storedAccount
+	if json.Unmarshal(b, &sa) != nil {
+		return nil
+	}
+	return cookiesFromStored(sa)
+}
+
+func (m *Manager) loadSettings() {
+	path := filepath.Join(m.dataDir, "settings.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var s settingsFile
+	if json.Unmarshal(b, &s) != nil {
+		return
+	}
+	if s.Mode == ModeManual || s.Mode == ModeSchedule {
+		m.mode = s.Mode
+	}
+	if s.WeekHours >= 1 {
+		m.weekHours = s.WeekHours
+	}
+}
+
+func (m *Manager) saveSettings() error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.saveSettingsLocked()
+}
+
+func (m *Manager) saveSettingsLocked() error {
+	s := settingsFile{Mode: m.mode, WeekHours: m.weekHours}
+	b, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	_ = os.MkdirAll(m.dataDir, 0o700)
+	return os.WriteFile(filepath.Join(m.dataDir, "settings.json"), b, 0o600)
+}
+
+func (m *Manager) List() []*Account {
+	m.mu.RLock()
+	mode := m.mode
+	states := make([]*accountState, 0, len(m.byLogin))
 	for _, st := range m.byLogin {
-		out = append(out, m.snapshot(st))
+		states = append(states, st)
+	}
+	m.mu.RUnlock()
+	out := make([]*Account, 0, len(states))
+	for _, st := range states {
+		out = append(out, m.snapshot(st, mode))
 	}
 	return out
 }
@@ -246,11 +425,12 @@ func (m *Manager) Active() *Account {
 	m.mu.RLock()
 	login := m.active
 	st := m.byLogin[login]
+	mode := m.mode
 	m.mu.RUnlock()
 	if st == nil {
 		return nil
 	}
-	return m.snapshot(st)
+	return m.snapshot(st, mode)
 }
 
 func (m *Manager) Select(login string) error {
@@ -286,18 +466,35 @@ func (m *Manager) Remove(login string) error {
 func (m *Manager) StartTracking(login string) error {
 	m.mu.RLock()
 	st, ok := m.byLogin[login]
+	mode := m.mode
 	m.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("аккаунт не найден")
 	}
 
-	slog.Info("start tracking", "login", login)
+	slog.Info("start tracking", "login", login, "mode", mode)
 	if _, err := st.client.AuthMe(); err != nil {
 		return fmt.Errorf("сессия истекла — войди снова: %w", err)
 	}
 	if err := st.client.PairAgent(); err != nil {
 		slog.Warn("agent pair failed", "login", login, "error", err)
 	}
+
+	quotaSec := 0
+	if mode == ModeSchedule {
+		if st.schedule.IsEmpty() {
+			return fmt.Errorf("сначала распредели график")
+		}
+		quotaSec = st.schedule.TodaySeconds(time.Now())
+		if quotaSec <= 0 {
+			return fmt.Errorf("сегодня выходной по графику (сб/вс)")
+		}
+		dash, _ := st.client.Dashboard()
+		if dash != nil && dash.Hours.TodaySeconds >= quotaSec {
+			return fmt.Errorf("квота на сегодня уже выполнена (%s)", formatHoursShort(quotaSec))
+		}
+	}
+	st.tracker.SetDailyQuota(quotaSec)
 
 	dash, _ := st.client.Dashboard()
 	if dash != nil && dash.Tracking.Active {
@@ -308,6 +505,18 @@ func (m *Manager) StartTracking(login string) error {
 		return fmt.Errorf("не удалось начать учёт: %w", err)
 	}
 	return st.tracker.Start()
+}
+
+func formatHoursShort(seconds int) string {
+	h := seconds / 3600
+	m := (seconds % 3600) / 60
+	if h == 0 {
+		return fmt.Sprintf("%dм", m)
+	}
+	if m == 0 {
+		return fmt.Sprintf("%dч", h)
+	}
+	return fmt.Sprintf("%dч %dм", h, m)
 }
 
 func (m *Manager) StopTracking(login string) {
@@ -321,7 +530,7 @@ func (m *Manager) StopTracking(login string) {
 	_ = st.client.StopTracking()
 }
 
-func (m *Manager) snapshot(st *accountState) *Account {
+func (m *Manager) snapshot(st *accountState, mode string) *Account {
 	ac := &Account{
 		Login:           st.login,
 		DisplayName:     st.displayName,
@@ -329,6 +538,14 @@ func (m *Manager) snapshot(st *accountState) *Account {
 		LastError:       st.tracker.LastError(),
 		Stalled:         st.stalled,
 		VirtualHostname: st.hostname,
+		QuotaReached:    st.tracker.QuotaReached(),
+	}
+	if !st.schedule.IsEmpty() {
+		sch := st.schedule
+		ac.Schedule = &sch
+		if mode == ModeSchedule {
+			ac.QuotaTodaySeconds = st.schedule.TodaySeconds(time.Now())
+		}
 	}
 	if dash, err := st.client.Dashboard(); err == nil {
 		ac.TodaySeconds = dash.Hours.TodaySeconds
@@ -345,6 +562,9 @@ func (m *Manager) snapshot(st *accountState) *Account {
 			st.stalled = true
 		}
 		ac.Stalled = st.stalled
+		if ac.QuotaTodaySeconds > 0 && dash.Hours.TodaySeconds >= ac.QuotaTodaySeconds {
+			ac.QuotaReached = true
+		}
 	}
 	if ac.StartedAt == "" && st.tracker.IsRunning() {
 		ts := st.tracker.State()

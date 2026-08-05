@@ -36,6 +36,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/accounts", s.handleAccounts)
 	mux.HandleFunc("POST /api/accounts/select", s.handleSelectAccount)
 	mux.HandleFunc("DELETE /api/accounts/{login}", s.handleRemoveAccount)
+	mux.HandleFunc("POST /api/mode", s.handleSetMode)
+	mux.HandleFunc("POST /api/schedule/distribute", s.handleDistributeSchedule)
 	mux.HandleFunc("GET /api/login-url", s.handleLoginURL)
 	mux.HandleFunc("POST /api/login/browser", s.handleBrowserLogin)
 	mux.HandleFunc("GET /api/login/browser/status", s.handleBrowserLoginStatus)
@@ -100,12 +102,16 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, map[string]any{
 			"authenticated": false,
 			"accounts":      s.accounts.List(),
+			"trackingMode":  s.accounts.Mode(),
+			"weekHours":     s.accounts.WeekHours(),
 		})
 		return
 	}
 	jsonOK(w, map[string]any{
 		"authenticated":  true,
 		"mode":           "api",
+		"trackingMode":   s.accounts.Mode(),
+		"weekHours":      s.accounts.WeekHours(),
 		"user":           map[string]string{"login": active.Login, "displayName": active.DisplayName},
 		"trackerRunning": active.Tracking,
 		"stalled":        active.Stalled,
@@ -154,6 +160,49 @@ func (s *Server) handleRemoveAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOK(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleSetMode(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Mode      string  `json:"mode"`
+		WeekHours float64 `json:"weekHours"`
+	}
+	if json.NewDecoder(r.Body).Decode(&body) != nil || body.Mode == "" {
+		jsonErr(w, http.StatusBadRequest, "нужен mode: manual или schedule")
+		return
+	}
+	if body.WeekHours > 0 {
+		if err := s.accounts.SetWeekHours(body.WeekHours); err != nil {
+			jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if err := s.accounts.SetMode(body.Mode); err != nil {
+		jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	jsonOK(w, map[string]any{
+		"ok":           true,
+		"trackingMode": s.accounts.Mode(),
+		"weekHours":    s.accounts.WeekHours(),
+	})
+}
+
+func (s *Server) handleDistributeSchedule(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		WeekHours float64 `json:"weekHours"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := s.accounts.DistributeSchedule(body.WeekHours); err != nil {
+		jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	jsonOK(w, map[string]any{
+		"ok":           true,
+		"trackingMode": s.accounts.Mode(),
+		"weekHours":    s.accounts.WeekHours(),
+		"accounts":     s.accounts.List(),
+	})
 }
 
 func (s *Server) handleLoginURL(w http.ResponseWriter, r *http.Request) {

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  distributeSchedule,
   fetchLogs,
   fetchStatus,
   formatDuration,
@@ -10,12 +11,27 @@ import {
   removeAccount,
   saveSession,
   selectAccount,
+  setTrackingMode,
   startBrowserLogin,
   startTracking,
   stopTracking,
   type Account,
   type Status,
+  type WeekSchedule,
 } from "./api";
+
+const DAY_LABELS: { key: keyof WeekSchedule; label: string }[] = [
+  { key: "mon", label: "Пн" },
+  { key: "tue", label: "Вт" },
+  { key: "wed", label: "Ср" },
+  { key: "thu", label: "Чт" },
+  { key: "fri", label: "Пт" },
+];
+
+function formatQuotaHours(h: number): string {
+  if (Number.isInteger(h)) return `${h}ч`;
+  return `${h}ч`;
+}
 
 export default function App() {
   const [status, setStatus] = useState<Status | null>(null);
@@ -26,11 +42,13 @@ export default function App() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [now, setNow] = useState(Date.now());
+  const [weekHoursInput, setWeekHoursInput] = useState("20");
 
   const refresh = useCallback(async () => {
     try {
       const s = await fetchStatus();
       setStatus(s);
+      if (s.weekHours) setWeekHoursInput(String(s.weekHours));
     } catch {
       setError("Не удалось связаться с backend (запущен ли go run .?)");
     }
@@ -144,6 +162,37 @@ export default function App() {
     await logout();
     await refresh();
   }
+
+  async function handleSetMode(mode: "manual" | "schedule") {
+    setLoading(true);
+    setError("");
+    try {
+      const wh = Number(weekHoursInput);
+      await setTrackingMode(mode, Number.isFinite(wh) ? wh : undefined);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Ошибка");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleDistribute() {
+    setLoading(true);
+    setError("");
+    try {
+      const wh = Number(weekHoursInput);
+      await distributeSchedule(Number.isFinite(wh) && wh > 0 ? wh : undefined);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Ошибка");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const trackingMode = status?.trackingMode ?? "manual";
+  const isSchedule = trackingMode === "schedule";
 
   if (!status) {
     return (
@@ -264,6 +313,59 @@ export default function App() {
             </div>
           )}
 
+          <section className="card">
+            <h3>Режим учёта</h3>
+            <div className="mode-toggle">
+              <button
+                className={`btn ${!isSchedule ? "btn--primary" : "btn--ghost"}`}
+                disabled={loading}
+                onClick={() => handleSetMode("manual")}
+              >
+                Ручной
+              </button>
+              <button
+                className={`btn ${isSchedule ? "btn--primary" : "btn--ghost"}`}
+                disabled={loading}
+                onClick={() => handleSetMode("schedule")}
+              >
+                По графику
+              </button>
+            </div>
+            {isSchedule ? (
+              <>
+                <p className="muted" style={{ marginTop: 12, marginBottom: 12 }}>
+                  Каждому аккаунту — свой график Пн–Пт. По достижении квоты на
+                  день учёт останавливается сам. Сб/вс — выходные.
+                </p>
+                <div className="schedule-controls">
+                  <label className="muted">
+                    Часов в неделю{" "}
+                    <input
+                      className="input input--sm"
+                      type="number"
+                      min={1}
+                      max={60}
+                      step={0.5}
+                      value={weekHoursInput}
+                      onChange={(e) => setWeekHoursInput(e.target.value)}
+                    />
+                  </label>
+                  <button
+                    className="btn btn--success"
+                    disabled={loading || !status.accounts?.length}
+                    onClick={handleDistribute}
+                  >
+                    Распределить график
+                  </button>
+                </div>
+              </>
+            ) : (
+              <p className="muted" style={{ marginTop: 12, marginBottom: 0 }}>
+                Как раньше: Старт/Стоп вручную, без лимита часов.
+              </p>
+            )}
+          </section>
+
           {status.accounts && status.accounts.length > 0 && (
             <section className="card">
               <h3>Аккаунты ({status.accounts.length})</h3>
@@ -274,19 +376,38 @@ export default function App() {
               </p>
               {status.accounts.map((a: Account) => {
                 const isActive = status.user?.login === a.login;
+                let todayLabel = `сегодня ${formatHours(a.todaySeconds)}`;
+                if (isSchedule) {
+                  if (a.quotaTodaySeconds) {
+                    todayLabel = `сегодня ${formatHours(a.todaySeconds)} / ${formatHours(a.quotaTodaySeconds)}`;
+                  } else if (a.schedule) {
+                    todayLabel = `сегодня ${formatHours(a.todaySeconds)} · выходной`;
+                  } else {
+                    todayLabel = `сегодня ${formatHours(a.todaySeconds)} · нет графика`;
+                  }
+                }
                 return (
                 <div key={a.login} className={`account-row${isActive ? " account-row--active" : ""}`}>
-                  <div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
                     <strong>{a.displayName}</strong>
                     <span className="muted"> @{a.login}</span>
                     <div className="muted" style={{ fontSize: "0.8rem" }}>
-                      {a.virtualHostname ? `Mac ${a.virtualHostname}` : ""}
-                      {a.virtualHostname ? " · " : ""}
-                      сегодня {formatHours(a.todaySeconds)}
+                      {a.virtualHostname ? `Mac ${a.virtualHostname} · ` : ""}
+                      {todayLabel}
                       {a.tracking ? " · учёт идёт" : ""}
+                      {a.quotaReached ? " · квота дня ✓" : ""}
                       {a.stalled ? " · ⚠️ не растёт" : ""}
                       {isActive ? " · смотришь сейчас" : ""}
                     </div>
+                    {isSchedule && a.schedule && (
+                      <div className="schedule-days">
+                        {DAY_LABELS.map(({ key, label }) => (
+                          <span key={key} className="schedule-day">
+                            <em>{label}</em> {formatQuotaHours(a.schedule![key])}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                     {a.lastError && (
                       <div style={{ fontSize: "0.75rem", color: "#fecaca", marginTop: 4 }}>
                         {a.lastError}
@@ -307,10 +428,14 @@ export default function App() {
                       <button
                         className="btn btn--success"
                         style={{ padding: "6px 12px", fontSize: "0.85rem" }}
-                        disabled={loading}
+                        disabled={loading || (isSchedule && !!a.quotaReached)}
                         onClick={async () => {
-                          await startTracking(a.login);
-                          await refresh();
+                          try {
+                            await startTracking(a.login);
+                            await refresh();
+                          } catch (e) {
+                            setError(e instanceof Error ? e.message : "Ошибка");
+                          }
                         }}
                       >
                         Старт
@@ -462,6 +587,27 @@ export default function App() {
           background: rgba(110,231,183,0.06);
           margin: 0 -12px; padding: 10px 12px;
           border-radius: 10px;
+        }
+        .mode-toggle { display: flex; gap: 8px; flex-wrap: wrap; }
+        .mode-toggle .btn { margin-top: 0; }
+        .schedule-controls {
+          display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+        }
+        .schedule-controls .btn { margin-top: 0; }
+        .input--sm {
+          width: 72px; margin-top: 0; margin-left: 8px;
+          padding: 6px 10px; display: inline-block;
+        }
+        .schedule-days {
+          display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px;
+        }
+        .schedule-day {
+          font-size: 0.72rem; color: var(--text-2);
+          background: var(--bg); border: 1px solid var(--border);
+          border-radius: 6px; padding: 2px 7px;
+        }
+        .schedule-day em {
+          font-style: normal; color: var(--text); margin-right: 2px;
         }
         .log-box {
           margin: 0; max-height: 320px; overflow: auto;

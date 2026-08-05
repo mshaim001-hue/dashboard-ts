@@ -27,10 +27,32 @@ type Tracker struct {
 	state          client.TrackingState
 	solvingCaptcha bool
 	lastToday      int
+	dailyQuota     int // seconds; 0 = unlimited (manual mode)
+	quotaReached   bool
 }
 
 func New(c *client.Dashboard) *Tracker {
 	return &Tracker{client: c}
+}
+
+// SetDailyQuota sets auto-stop limit in seconds. 0 disables the limit.
+func (t *Tracker) SetDailyQuota(seconds int) {
+	t.mu.Lock()
+	t.dailyQuota = seconds
+	t.quotaReached = false
+	t.mu.Unlock()
+}
+
+func (t *Tracker) DailyQuota() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.dailyQuota
+}
+
+func (t *Tracker) QuotaReached() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.quotaReached
 }
 
 func (t *Tracker) IsRunning() bool {
@@ -64,6 +86,7 @@ func (t *Tracker) Start() error {
 	t.cancel = cancel
 	t.running = true
 	t.lastErr = ""
+	t.quotaReached = false
 	t.mu.Unlock()
 
 	slog.Info("tracker started", "deviceId", t.client.DeviceID())
@@ -144,7 +167,18 @@ func (t *Tracker) beat() {
 			slog.Info("time credited", "delta", today-t.lastToday, "todaySeconds", today)
 			t.lastToday = today
 		}
+		quota := t.dailyQuota
 		t.mu.Unlock()
+
+		if quota > 0 && today >= quota {
+			t.mu.Lock()
+			t.quotaReached = true
+			t.lastErr = ""
+			t.mu.Unlock()
+			slog.Info("daily quota reached — stopping", "todaySeconds", today, "quota", quota)
+			go t.stopForQuota()
+			return
+		}
 	}
 
 	if st.ChallengePending {
@@ -163,6 +197,11 @@ func (t *Tracker) beat() {
 		}
 		slog.Info("session auto-restarted")
 	}
+}
+
+func (t *Tracker) stopForQuota() {
+	t.Stop()
+	_ = t.client.StopTracking()
 }
 
 func (t *Tracker) solveCaptcha() {
