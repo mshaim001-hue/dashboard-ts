@@ -44,6 +44,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/session", s.handleSaveSession)
 	mux.HandleFunc("POST /api/tracking/start", s.handleTrackingStart)
 	mux.HandleFunc("POST /api/tracking/stop", s.handleTrackingStop)
+	mux.HandleFunc("POST /api/rotation/start", s.handleRotationStart)
+	mux.HandleFunc("POST /api/rotation/stop", s.handleRotationStop)
 	mux.HandleFunc("GET /api/dashboard", s.handleDashboard)
 	mux.HandleFunc("POST /api/logout", s.handleLogout)
 	mux.HandleFunc("GET /auth/done", s.handleAuthDone)
@@ -97,6 +99,10 @@ func corsMiddleware(next http.Handler) http.Handler {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	rotation := map[string]any{
+		"active":       s.accounts.RotationActive(),
+		"currentLogin": s.accounts.RotationLogin(),
+	}
 	active := s.accounts.Active()
 	if active == nil {
 		jsonOK(w, map[string]any{
@@ -104,14 +110,16 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			"accounts":      s.accounts.List(),
 			"trackingMode":  s.accounts.Mode(),
 			"weekHours":     s.accounts.WeekHours(),
+			"rotation":      rotation,
 		})
 		return
 	}
 	jsonOK(w, map[string]any{
 		"authenticated":  true,
-		"mode":           "api",
+		"mode":           "keeper",
 		"trackingMode":   s.accounts.Mode(),
 		"weekHours":      s.accounts.WeekHours(),
+		"rotation":       rotation,
 		"user":           map[string]string{"login": active.Login, "displayName": active.DisplayName},
 		"trackerRunning": active.Tracking,
 		"stalled":        active.Stalled,
@@ -286,10 +294,38 @@ func (s *Server) handleTrackingStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("tracking started via API", "login", loginName)
-	jsonOK(w, map[string]any{"ok": true, "mode": "api", "login": loginName})
+	jsonOK(w, map[string]any{"ok": true, "mode": "keeper", "login": loginName})
+}
+
+func (s *Server) handleRotationStart(w http.ResponseWriter, r *http.Request) {
+	if len(s.accounts.List()) == 0 {
+		jsonErr(w, http.StatusBadRequest, "сначала добавь аккаунт")
+		return
+	}
+	if err := s.accounts.StartRotation(); err != nil {
+		jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	jsonOK(w, map[string]any{
+		"ok":       true,
+		"rotation": map[string]any{"active": true},
+	})
+}
+
+func (s *Server) handleRotationStop(w http.ResponseWriter, r *http.Request) {
+	s.accounts.StopRotation()
+	jsonOK(w, map[string]any{
+		"ok":       true,
+		"rotation": map[string]any{"active": false},
+	})
 }
 
 func (s *Server) handleTrackingStop(w http.ResponseWriter, r *http.Request) {
+	if s.accounts.RotationActive() {
+		s.accounts.StopRotation()
+		jsonOK(w, map[string]any{"ok": true, "rotationStopped": true})
+		return
+	}
 	loginName := ""
 	var body struct {
 		Login string `json:"login"`

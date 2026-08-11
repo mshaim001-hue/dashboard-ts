@@ -18,21 +18,25 @@ import (
 // Keeper runs the real dashboard in Chrome so official JS handles heartbeat,
 // fingerprint, idle detection, agent pairing and captcha UI.
 type Keeper struct {
-	mu          sync.RWMutex
-	client      *client.Dashboard
-	running     bool
-	cancel      context.CancelFunc
-	browser     *rod.Browser
-	page        *rod.Page
-	lastError   string
-	lastToday   int
-	lastTodayAt time.Time
-	stalled     bool
-	tickCount   int
+	mu           sync.RWMutex
+	client       *client.Dashboard
+	chromeDir    string
+	running      bool
+	cancel       context.CancelFunc
+	browser      *rod.Browser
+	page         *rod.Page
+	lastError    string
+	lastToday    int
+	lastTodayAt  time.Time
+	stalled      bool
+	tickCount    int
+	dailyQuota   int
+	quotaReached bool
+	quotaRefresh func() int
 }
 
-func NewKeeper(c *client.Dashboard) *Keeper {
-	return &Keeper{client: c}
+func NewKeeper(c *client.Dashboard, chromeDir string) *Keeper {
+	return &Keeper{client: c, chromeDir: chromeDir}
 }
 
 func (k *Keeper) IsRunning() bool {
@@ -53,6 +57,51 @@ func (k *Keeper) Stalled() bool {
 	return k.stalled
 }
 
+func (k *Keeper) SetDailyQuota(seconds int) {
+	k.mu.Lock()
+	k.dailyQuota = seconds
+	k.quotaReached = false
+	k.mu.Unlock()
+}
+
+func (k *Keeper) DailyQuota() int {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	return k.dailyQuota
+}
+
+func (k *Keeper) SetQuotaRefresh(fn func() int) {
+	k.mu.Lock()
+	k.quotaRefresh = fn
+	k.mu.Unlock()
+}
+
+func (k *Keeper) UpdateDailyQuota(seconds int) {
+	k.mu.Lock()
+	if seconds > 0 {
+		k.dailyQuota = seconds
+	}
+	k.mu.Unlock()
+}
+
+func (k *Keeper) refreshQuota() {
+	k.mu.RLock()
+	fn := k.quotaRefresh
+	k.mu.RUnlock()
+	if fn == nil {
+		return
+	}
+	if q := fn(); q > 0 {
+		k.UpdateDailyQuota(q)
+	}
+}
+
+func (k *Keeper) QuotaReached() bool {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	return k.quotaReached
+}
+
 func (k *Keeper) Start(ctx context.Context) error {
 	k.mu.Lock()
 	if k.running {
@@ -66,6 +115,9 @@ func (k *Keeper) Start(ctx context.Context) error {
 	k.lastError = ""
 	k.stalled = false
 	k.tickCount = 0
+	if k.dailyQuota > 0 {
+		k.quotaReached = false
+	}
 	k.mu.Unlock()
 
 	slog.Info("keeper starting")
@@ -83,8 +135,12 @@ func (k *Keeper) Stop() {
 	browser := k.browser
 	k.page = nil
 	k.browser = nil
+	k.quotaRefresh = nil
 	k.mu.Unlock()
 
+	if page != nil {
+		k.clickStopTracking(page)
+	}
 	if cancel != nil {
 		cancel()
 	}
@@ -114,12 +170,15 @@ func (k *Keeper) run(ctx context.Context) {
 		return
 	}
 
-	slog.Info("keeper: launching Chrome", "bin", path)
-	u := launcher.New().Bin(path).
+	slog.Info("keeper: launching Chrome", "bin", path, "profile", k.chromeDir)
+	l := launcher.New().Bin(path).
 		Headless(false).
 		Devtools(false).
-		Set("window-size", "1280,800").
-		MustLaunch()
+		Set("window-size", "1280,800")
+	if k.chromeDir != "" {
+		l = l.UserDataDir(k.chromeDir)
+	}
+	u := l.MustLaunch()
 
 	browser := rod.New().ControlURL(u).MustConnect()
 	k.mu.Lock()
@@ -144,10 +203,10 @@ func (k *Keeper) run(ctx context.Context) {
 
 	slog.Info("keeper: navigating to dashboard")
 	page.MustNavigate(client.BaseURL + "/").MustWaitLoad()
-	time.Sleep(2 * time.Second)
+	time.Sleep(5 * time.Second)
 
 	k.logBrowserState(page, "after load")
-	k.clickStartTracking(page)
+	k.ensureTrackingStarted(page)
 
 	tick := time.NewTicker(25 * time.Second)
 	defer tick.Stop()
@@ -213,20 +272,91 @@ func (k *Keeper) injectCookies(page *rod.Page) error {
 	return page.SetCookies(params)
 }
 
-func (k *Keeper) clickStartTracking(page *rod.Page) {
+func (k *Keeper) clickStopTracking(page *rod.Page) {
 	res, err := page.Eval(`() => {
 		const btns = [...document.querySelectorAll('button')];
-		const btn = btns.find(b => (b.textContent || '').includes('Запустить учёт'));
+		const btn = btns.find(b => (b.textContent || '').includes('Остановить учёт'));
 		if (btn) { btn.click(); return 'clicked'; }
-		const active = btns.find(b => (b.textContent || '').includes('Учёт идёт'));
-		if (active) return 'already_active';
+		const idle = btns.find(b => (b.textContent || '').includes('Учёт не идёт'));
+		if (idle) return 'already_stopped';
 		return 'button_not_found';
 	}`)
 	if err != nil {
-		slog.Warn("keeper: click start failed", "error", err)
+		slog.Warn("keeper: click stop failed", "error", err)
 		return
 	}
-	slog.Info("keeper: start tracking click", "result", res.Value.String())
+	slog.Info("keeper: stop tracking click", "result", res.Value.String())
+}
+
+func (k *Keeper) ensureTrackingStarted(page *rod.Page) {
+	for attempt := 1; attempt <= 12; attempt++ {
+		if result := k.startTrackingFromClient(); k.trackingStartOK(result) {
+			slog.Info("keeper: tracking ready", "attempt", attempt, "result", result)
+			return
+		}
+		result := k.clickStartTracking(page)
+		if k.trackingStartOK(result) {
+			slog.Info("keeper: tracking ready", "attempt", attempt, "result", result)
+			return
+		}
+		slog.Info("keeper: waiting for start button", "attempt", attempt, "result", result)
+		time.Sleep(5 * time.Second)
+	}
+	k.setError("не удалось запустить учёт — нажми «Запустить учёт» в Chrome вручную")
+}
+
+func (k *Keeper) trackingStartOK(result string) bool {
+	return result == "clicked" || result == "already_active" ||
+		result == "api_started" || result == "client_started"
+}
+
+func (k *Keeper) startTrackingFromClient() string {
+	if _, err := k.client.StartTracking(nil, nil, nil); err != nil {
+		return "client_failed:" + err.Error()
+	}
+	dash, err := k.client.Dashboard()
+	if err != nil {
+		return "client_check_failed"
+	}
+	if dash.Tracking.Active {
+		return "client_started"
+	}
+	return "client_inactive"
+}
+
+func (k *Keeper) clickStartTracking(page *rod.Page) string {
+	deviceID := k.client.DeviceID()
+	deviceName := k.client.DeviceName()
+	fingerprint := k.client.Fingerprint()
+	res, err := page.Eval(`async (deviceId, deviceName, fingerprint) => {
+		const btns = [...document.querySelectorAll('button')];
+		const labels = btns.map(b => (b.textContent || '').trim()).filter(Boolean);
+		const start = btns.find(b => /запустить учёт|start tracking/i.test(b.textContent || ''));
+		if (start) { start.click(); return 'clicked'; }
+		const active = btns.find(b => /учёт идёт|tracking/i.test(b.textContent || ''));
+		if (active) return 'already_active';
+		try {
+			const me = await fetch('/api/v1/auth/me', {credentials:'include'}).then(r => r.json());
+			if (!me.authenticated) return 'not_auth:' + labels.slice(0, 6).join('|');
+			const r = await fetch('/api/v1/tracking/start', {
+				method: 'POST',
+				credentials: 'include',
+				headers: {'Content-Type':'application/json','X-CSRF-Token': me.csrfToken,'Accept':'application/json'},
+				body: JSON.stringify({deviceId, deviceName, fingerprint}),
+			});
+			if (r.ok) return 'api_started';
+			return 'api_failed:' + (await r.text()).slice(0, 120);
+		} catch (e) {
+			return 'error:' + String(e);
+		}
+	}`, deviceID, deviceName, fingerprint)
+	if err != nil {
+		slog.Warn("keeper: click start failed", "error", err)
+		return "eval_error"
+	}
+	result := res.Value.String()
+	slog.Info("keeper: start tracking attempt", "result", result)
+	return result
 }
 
 func (k *Keeper) tick(page *rod.Page) {
@@ -285,15 +415,32 @@ func (k *Keeper) tick(page *rod.Page) {
 	}
 
 	if !dash.Tracking.Active {
-		slog.Warn("keeper: tracking INACTIVE — restarting via browser only (no Go API to avoid device conflict)")
-		k.clickStartTracking(page)
-		k.logBrowserState(page, "after restart click")
-		// НЕ вызываем client.StartTracking — другой deviceId ломает сессию Chrome
+		slog.Warn("keeper: tracking INACTIVE — restarting")
+		result := k.startTrackingFromClient()
+		if !k.trackingStartOK(result) {
+			result = k.clickStartTracking(page)
+		}
+		if !k.trackingStartOK(result) {
+			k.logBrowserState(page, "after restart attempt")
+		}
 	}
 
 	if dash.Tracking.ChallengePending {
 		slog.Info("keeper: captcha challenge pending")
 		go k.solveCaptchaInPage(page)
+	}
+
+	k.refreshQuota()
+	quota := k.DailyQuota()
+	if quota > 0 && today >= quota {
+		slog.Info("keeper: daily quota reached — stopping", "todaySeconds", today, "quota", quota)
+		k.mu.Lock()
+		k.quotaReached = true
+		k.lastError = ""
+		k.mu.Unlock()
+		k.clickStopTracking(page)
+		go k.Stop()
+		return
 	}
 
 	_, _ = page.Eval(`() => { document.dispatchEvent(new Event('visibilitychange')); window.dispatchEvent(new Event('focus')); }`)

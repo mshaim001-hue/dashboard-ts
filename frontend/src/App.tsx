@@ -13,7 +13,9 @@ import {
   selectAccount,
   setTrackingMode,
   startBrowserLogin,
+  startRotation,
   startTracking,
+  stopRotation,
   stopTracking,
   type Account,
   type Status,
@@ -31,6 +33,12 @@ const DAY_LABELS: { key: keyof WeekSchedule; label: string }[] = [
 function formatQuotaHours(h: number): string {
   if (Number.isInteger(h)) return `${h}ч`;
   return `${h}ч`;
+}
+
+function currentWeekdayIndex(): number {
+  const day = new Date().getDay();
+  if (day === 0 || day === 6) return -1;
+  return day - 1;
 }
 
 export default function App() {
@@ -138,6 +146,26 @@ export default function App() {
     }
   }
 
+  async function handleStartRotation() {
+    setLoading(true);
+    setError("");
+    try {
+      await startRotation();
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Ошибка");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleStopRotation() {
+    setLoading(true);
+    await stopRotation();
+    await refresh();
+    setLoading(false);
+  }
+
   async function handleStart() {
     setLoading(true);
     setError("");
@@ -193,6 +221,9 @@ export default function App() {
 
   const trackingMode = status?.trackingMode ?? "manual";
   const isSchedule = trackingMode === "schedule";
+  const rotationActive = status?.rotation?.active ?? false;
+  const rotationLogin = status?.rotation?.currentLogin;
+  const anyKeeperRunning = status?.accounts?.some((a) => a.tracking) ?? false;
 
   if (!status) {
     return (
@@ -224,7 +255,7 @@ export default function App() {
           <h2>Вход</h2>
           <p className="muted" style={{ marginBottom: 16 }}>
             Войди через Gitea — потом можно добавить друзей кнопкой «+ Добавить
-            аккаунт». Chrome нужен только на минуту для входа, не для учёта.
+            аккаунт». Для учёта часов откроется Chrome (Keeper).
           </p>
           <button
             className="btn btn--primary"
@@ -295,11 +326,21 @@ export default function App() {
               </span>
               <span className="hint">
                 {status.trackerRunning
-                  ? "API heartbeat каждые 30 сек — Chrome не нужен"
-                  : "нажми «Запустить учёт»"}
+                  ? "Chrome Keeper — официальный JS + agent on device"
+                  : rotationActive
+                    ? "авто-ротация по графику"
+                    : "нажми «Запустить учёт»"}
               </span>
             </div>
           </section>
+
+          {rotationActive && (
+            <div className="alert alert--warning">
+              Авто-ротация: сейчас{" "}
+              {rotationLogin ? `@${rotationLogin}` : "ожидание следующего аккаунта"}.
+              Один Chrome — аккаунты по очереди до квоты дня.
+            </div>
+          )}
 
           {status.stalled && (
             <div className="alert alert--error">
@@ -334,8 +375,11 @@ export default function App() {
             {isSchedule ? (
               <>
                 <p className="muted" style={{ marginTop: 12, marginBottom: 12 }}>
-                  Каждому аккаунту — свой график Пн–Пт. По достижении квоты на
-                  день учёт останавливается сам. Сб/вс — выходные.
+                  Каждому аккаунту — свой график Пн–Пт (**веса**). **Сегодня** —
+                  факт / динамическая квота (синяя). **Прошлые дни** — сколько
+                  засчиталось (зелёные). **Будущие** — только вес распределения.
+                  В **00:00** график обновляется; ротация продолжается сама, если
+                  backend не перезапускали.
                 </p>
                 <div className="schedule-controls">
                   <label className="muted">
@@ -357,6 +401,23 @@ export default function App() {
                   >
                     Распределить график
                   </button>
+                  {!rotationActive ? (
+                    <button
+                      className="btn btn--primary"
+                      disabled={loading || !status.accounts?.length || anyKeeperRunning}
+                      onClick={handleStartRotation}
+                    >
+                      Запустить ротацию
+                    </button>
+                  ) : (
+                    <button
+                      className="btn btn--danger"
+                      disabled={loading}
+                      onClick={handleStopRotation}
+                    >
+                      Остановить ротацию
+                    </button>
+                  )}
                 </div>
               </>
             ) : (
@@ -370,9 +431,9 @@ export default function App() {
             <section className="card">
               <h3>Аккаунты ({status.accounts.length})</h3>
               <p className="muted" style={{ marginBottom: 12 }}>
-                Старт/Стоп — учёт для каждого отдельно, работают параллельно.
-                У каждого аккаунта свой виртуальный Mac (E3-XX). «Смотреть» —
-                переключить карточки сверху.
+                Учёт через Chrome (Keeper): один активный аккаунт за раз.
+                «Смотреть» — переключить карточки сверху. Для графика удобнее
+                «Запустить ротацию».
               </p>
               {status.accounts.map((a: Account) => {
                 const isActive = status.user?.login === a.login;
@@ -380,6 +441,11 @@ export default function App() {
                 if (isSchedule) {
                   if (a.quotaTodaySeconds) {
                     todayLabel = `сегодня ${formatHours(a.todaySeconds)} / ${formatHours(a.quotaTodaySeconds)}`;
+                    if (a.weekRemainingSeconds != null && a.weekRemainingSeconds > 0) {
+                      todayLabel += ` · неделя −${formatHours(a.weekRemainingSeconds)}`;
+                    } else if (a.weekRemainingSeconds === 0) {
+                      todayLabel += ` · неделя ✓`;
+                    }
                   } else if (a.schedule) {
                     todayLabel = `сегодня ${formatHours(a.todaySeconds)} · выходной`;
                   } else {
@@ -394,18 +460,45 @@ export default function App() {
                     <div className="muted" style={{ fontSize: "0.8rem" }}>
                       {a.virtualHostname ? `Mac ${a.virtualHostname} · ` : ""}
                       {todayLabel}
-                      {a.tracking ? " · учёт идёт" : ""}
+                      {a.tracking ? " · Chrome идёт" : ""}
+                      {rotationActive && rotationLogin === a.login ? " · ротация" : ""}
                       {a.quotaReached ? " · квота дня ✓" : ""}
                       {a.stalled ? " · ⚠️ не растёт" : ""}
                       {isActive ? " · смотришь сейчас" : ""}
                     </div>
                     {isSchedule && a.schedule && (
                       <div className="schedule-days">
-                        {DAY_LABELS.map(({ key, label }) => (
-                          <span key={key} className="schedule-day">
-                            <em>{label}</em> {formatQuotaHours(a.schedule![key])}
-                          </span>
-                        ))}
+                        {DAY_LABELS.map(({ key, label }, idx) => {
+                          const wdIdx = currentWeekdayIndex();
+                          const isToday = wdIdx === idx;
+                          const isPast = wdIdx >= 0 && idx < wdIdx;
+                          const isFuture = wdIdx >= 0 && idx > wdIdx;
+                          const actual = a.weekDaysActual?.[key];
+                          const weight = a.schedule![key];
+                          let value = "";
+                          if (isToday && a.quotaTodaySeconds) {
+                            value = `${formatHours(a.todaySeconds)} / ${formatHours(a.quotaTodaySeconds)}`;
+                          } else if (isPast) {
+                            value = actual != null && actual > 0 ? formatHours(actual) : "—";
+                          } else if (isFuture) {
+                            value = `вес ${formatQuotaHours(weight)}`;
+                          } else if (isToday) {
+                            value = formatHours(a.todaySeconds);
+                          } else {
+                            value = formatQuotaHours(weight);
+                          }
+                          const cls = [
+                            "schedule-day",
+                            isToday ? "schedule-day--today" : "",
+                            isPast && actual != null && actual > 0 ? "schedule-day--past" : "",
+                            isFuture ? "schedule-day--future" : "",
+                          ].filter(Boolean).join(" ");
+                          return (
+                            <span key={key} className={cls} title={isFuture || isPast ? `вес ${formatQuotaHours(weight)}` : undefined}>
+                              <em>{label}</em> {value}
+                            </span>
+                          );
+                        })}
                       </div>
                     )}
                     {a.lastError && (
@@ -428,7 +521,7 @@ export default function App() {
                       <button
                         className="btn btn--success"
                         style={{ padding: "6px 12px", fontSize: "0.85rem" }}
-                        disabled={loading || (isSchedule && !!a.quotaReached)}
+                        disabled={loading || (isSchedule && !!a.quotaReached) || rotationActive || (anyKeeperRunning && !a.tracking)}
                         onClick={async () => {
                           try {
                             await startTracking(a.login);
@@ -483,13 +576,21 @@ export default function App() {
           )}
 
           <section className="card actions">
-            {!status.tracking?.active ? (
+            {rotationActive ? (
+              <button
+                className="btn btn--danger"
+                disabled={loading}
+                onClick={handleStopRotation}
+              >
+                Остановить ротацию
+              </button>
+            ) : !status.tracking?.active ? (
               <button
                 className="btn btn--success"
-                disabled={loading}
+                disabled={loading || anyKeeperRunning}
                 onClick={handleStart}
               >
-                Запустить учёт
+                Запустить учёт (Chrome)
               </button>
             ) : (
               <button
@@ -525,25 +626,29 @@ export default function App() {
           )}
 
           <section className="card info">
-            <h3>Режим API — без Chrome</h3>
+            <h3>Режим Chrome Keeper</h3>
             <ul>
               <li>
-                Heartbeat каждые <strong>30 сек</strong> напрямую на сервер
-                школы.
+                Открывается <strong>настоящий Chrome</strong> — heartbeat и agent
+                pair делает официальный JS школы.
               </li>
               <li>
-                По умолчанию всегда <strong>active</strong> — не нужно трогать
-                мышь Mac. Школьный idle только с флагом <code>-detect-idle</code>.
+                В Chrome для <strong>dashboard.tomorrow-school.ai</strong>{" "}
+                включи <strong>Apps on device</strong> (замок в адресной
+                строке). Без этого время не начисляется.
               </li>
               <li>
-                <strong>Captcha</strong> — решается автоматически (macOS Vision).
+                Профиль Chrome сохраняется в{" "}
+                <code>~/.ts-tracker/chrome-keeper</code> — разрешение нужно
+                один раз.
               </li>
               <li>
-                <strong>Agent pair</strong> каждые 10 мин (:47836).
+                <strong>Ротация</strong> — по графику один аккаунт за другим до
+                дневной квоты. Только один Chrome одновременно.
               </li>
               <li>
-                Друг сидел всю ночь, а 2ч — скорее idle + captcha + сессия
-                упала. Смотри логи.
+                <strong>Полночь (00:00)</strong> — новый график на день и авто-продолжение
+                ротации (перезапуск backend не нужен).
               </li>
             </ul>
           </section>
@@ -605,6 +710,21 @@ export default function App() {
           font-size: 0.72rem; color: var(--text-2);
           background: var(--bg); border: 1px solid var(--border);
           border-radius: 6px; padding: 2px 7px;
+        }
+        .schedule-day--today {
+          color: var(--text);
+          border-color: var(--accent);
+          background: rgba(96,165,250,0.12);
+          font-weight: 600;
+        }
+        .schedule-day--past {
+          color: #86efac;
+          border-color: rgba(134,239,172,0.35);
+          background: rgba(134,239,172,0.08);
+        }
+        .schedule-day--future {
+          opacity: 0.65;
+          font-style: italic;
         }
         .schedule-day em {
           font-style: normal; color: var(--text); margin-right: 2px;

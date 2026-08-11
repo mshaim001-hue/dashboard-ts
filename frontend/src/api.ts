@@ -13,12 +13,14 @@ export type Account = {
   sessionActive?: boolean;
   todaySeconds: number;
   weekSeconds: number;
+  weekRemainingSeconds?: number;
   stalled?: boolean;
   lastError?: string;
   virtualHostname?: string;
   schedule?: WeekSchedule;
   quotaTodaySeconds?: number;
   quotaReached?: boolean;
+  weekDaysActual?: Partial<Record<keyof WeekSchedule, number>>;
 };
 
 export type Status = {
@@ -30,6 +32,10 @@ export type Status = {
   trackerRunning?: boolean;
   stalled?: boolean;
   lastError?: string;
+  rotation?: {
+    active: boolean;
+    currentLogin?: string;
+  };
   tracking?: {
     active: boolean;
     startedAt?: string;
@@ -123,6 +129,18 @@ export async function stopTracking(login?: string): Promise<void> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(login ? { login } : {}),
   });
+}
+
+export async function startRotation(): Promise<void> {
+  const res = await fetch(`${API}/rotation/start`, { method: "POST" });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error ?? "Не удалось запустить ротацию");
+  }
+}
+
+export async function stopRotation(): Promise<void> {
+  await fetch(`${API}/rotation/stop`, { method: "POST" });
 }
 
 export async function setTrackingMode(

@@ -305,3 +305,7 @@ func (d *Dashboard) DeviceID() string {
 func (d *Dashboard) DeviceName() string {
 	return d.deviceName
 }
+
+func (d *Dashboard) Fingerprint() string {
+	return d.fingerprint
+}
