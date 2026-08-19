@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", ":8080", "HTTP listen address")
+	addr := flag.String("addr", ":8081", "HTTP listen address")
 	agentAddr := flag.String("agent-addr", ":47836", "local agent listen address (empty to disable)")
 	dataDir := flag.String("data", defaultDataDir(), "directory for session storage")
 	frontend := flag.String("frontend", "", "path to built frontend (optional)")

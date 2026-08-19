@@ -16,6 +16,9 @@ import (
 
 const BaseURL = "https://dashboard.tomorrow-school.ai"
 
+// dashCacheTTL coalesces bursty callers (status poll, List, keeper tick).
+const dashCacheTTL = 8 * time.Second
+
 type Dashboard struct {
 	mu          sync.RWMutex
 	http        *http.Client
@@ -23,6 +26,12 @@ type Dashboard struct {
 	deviceID    string
 	deviceName  string
 	fingerprint string
+
+	dashMu       sync.Mutex
+	dashCached   *DashboardResponse
+	dashErr      error
+	dashExpires  time.Time
+	dashWait     chan struct{}
 }
 
 func New(deviceID, deviceName, fingerprint string) *Dashboard {
@@ -199,16 +208,71 @@ func (d *Dashboard) AuthMe() (*AuthMeResponse, error) {
 	return &res, nil
 }
 
+func (d *Dashboard) InvalidateDashboardCache() {
+	d.dashMu.Lock()
+	d.dashCached = nil
+	d.dashErr = nil
+	d.dashExpires = time.Time{}
+	d.dashMu.Unlock()
+}
+
 func (d *Dashboard) Dashboard() (*DashboardResponse, error) {
+	d.dashMu.Lock()
+	if !d.dashExpires.IsZero() && time.Now().Before(d.dashExpires) {
+		res, err := d.dashCached, d.dashErr
+		d.dashMu.Unlock()
+		if res != nil {
+			cp := *res
+			return &cp, nil
+		}
+		return nil, err
+	}
+	if d.dashWait != nil {
+		wait := d.dashWait
+		d.dashMu.Unlock()
+		<-wait
+		d.dashMu.Lock()
+		res, err := d.dashCached, d.dashErr
+		d.dashMu.Unlock()
+		if res != nil {
+			cp := *res
+			return &cp, err
+		}
+		return nil, err
+	}
+	wait := make(chan struct{})
+	d.dashWait = wait
+	d.dashMu.Unlock()
+
 	data, _, err := d.do(http.MethodGet, "/api/v1/dashboard", nil)
+	var res *DashboardResponse
+	if err == nil {
+		var parsed DashboardResponse
+		if uerr := json.Unmarshal(data, &parsed); uerr != nil {
+			err = uerr
+		} else {
+			res = &parsed
+		}
+	}
+
+	ttl := dashCacheTTL
 	if err != nil {
-		return nil, err
+		ttl = 2 * time.Second
 	}
-	var res DashboardResponse
-	if err := json.Unmarshal(data, &res); err != nil {
-		return nil, err
+
+	d.dashMu.Lock()
+	d.dashCached = res
+	d.dashErr = err
+	d.dashExpires = time.Now().Add(ttl)
+	d.dashWait = nil
+	close(wait)
+	d.dashMu.Unlock()
+
+	if res != nil {
+		cp := *res
+		return &cp, nil
 	}
-	return &res, nil
+	return nil, err
 }
 
 func (d *Dashboard) StartTracking(lat, lon *float64, accuracy *float64) (*TrackingResponse, error) {
@@ -225,6 +289,7 @@ func (d *Dashboard) StartTracking(lat, lon *float64, accuracy *float64) (*Tracki
 		}
 	}
 	data, _, err := d.do(http.MethodPost, "/api/v1/tracking/start", body)
+	d.InvalidateDashboardCache()
 	if err != nil {
 		return nil, err
 	}
@@ -237,6 +302,7 @@ func (d *Dashboard) StartTracking(lat, lon *float64, accuracy *float64) (*Tracki
 
 func (d *Dashboard) StopTracking() error {
 	_, _, err := d.do(http.MethodPost, "/api/v1/tracking/stop", map[string]any{})
+	d.InvalidateDashboardCache()
 	return err
 }
 

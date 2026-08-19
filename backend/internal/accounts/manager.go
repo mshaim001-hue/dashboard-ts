@@ -484,6 +484,23 @@ func (m *Manager) Active() *Account {
 	return m.snapshot(st, mode)
 }
 
+// ActiveFrom returns the selected account from an already-built List() result,
+// avoiding a second round of upstream dashboard fetches.
+func (m *Manager) ActiveFrom(accounts []*Account) *Account {
+	m.mu.RLock()
+	login := m.active
+	m.mu.RUnlock()
+	if login == "" {
+		return nil
+	}
+	for _, a := range accounts {
+		if a != nil && a.Login == login {
+			return a
+		}
+	}
+	return nil
+}
+
 func (m *Manager) Select(login string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -626,6 +643,13 @@ func (m *Manager) todayQuotaFor(st *accountState, now time.Time) int {
 	return DynamicTodayQuota(st.schedule, weekHours, weekSec, todaySec, now)
 }
 
+func (m *Manager) todayQuotaFromHours(st *accountState, weekSec, todaySec int, now time.Time) int {
+	m.mu.RLock()
+	weekHours := m.weekHours
+	m.mu.RUnlock()
+	return DynamicTodayQuota(st.schedule, weekHours, weekSec, todaySec, now)
+}
+
 func (m *Manager) stopAllKeepersExcept(login string) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -649,55 +673,54 @@ func (m *Manager) snapshot(st *accountState, mode string) *Account {
 	if !st.schedule.IsEmpty() {
 		sch := st.schedule
 		ac.Schedule = &sch
-		if mode == ModeSchedule {
-			now := time.Now()
-			ac.QuotaTodaySeconds = m.todayQuotaFor(st, now)
+	}
+
+	dash, err := st.client.Dashboard()
+	if err != nil {
+		return ac
+	}
+
+	ac.TodaySeconds = dash.Hours.TodaySeconds
+	ac.WeekSeconds = dash.Hours.WeekSeconds
+	ac.WeekRemainingSec = WeekRemainingSeconds(m.WeekHours(), dash.Hours.WeekSeconds)
+	ac.SessionActive = dash.Tracking.Active
+	ac.StartedAt = dash.Tracking.StartedAt
+	ac.ChallengePending = dash.Tracking.ChallengePending
+
+	if !st.schedule.IsEmpty() && mode == ModeSchedule {
+		ac.QuotaTodaySeconds = m.todayQuotaFromHours(st, dash.Hours.WeekSeconds, dash.Hours.TodaySeconds, time.Now())
+	}
+
+	if dash.Hours.TodaySeconds > st.lastToday {
+		st.lastToday = dash.Hours.TodaySeconds
+		st.lastTodayAt = time.Now()
+		st.stalled = false
+	} else if st.keeper.IsRunning() && !st.lastTodayAt.IsZero() &&
+		time.Since(st.lastTodayAt) > 4*time.Minute {
+		st.stalled = true
+	}
+	ac.Stalled = st.stalled || st.keeper.Stalled()
+	if ac.QuotaTodaySeconds > 0 && dash.Hours.TodaySeconds >= ac.QuotaTodaySeconds {
+		ac.QuotaReached = true
+	}
+	m.recordDayActual(st, dash.Hours.TodaySeconds)
+	now := time.Now()
+	m.backfillPastDays(st, dash.Hours.TodaySeconds, dash.Hours.WeekSeconds, now)
+	if len(st.weekDays.Days) > 0 {
+		ac.WeekDaysActual = make(map[string]int, len(st.weekDays.Days))
+		for k, v := range st.weekDays.Days {
+			ac.WeekDaysActual[k] = v
 		}
 	}
-	if dash, err := st.client.Dashboard(); err == nil {
-		ac.TodaySeconds = dash.Hours.TodaySeconds
-		ac.WeekSeconds = dash.Hours.WeekSeconds
-		ac.WeekRemainingSec = WeekRemainingSeconds(m.WeekHours(), dash.Hours.WeekSeconds)
-		ac.SessionActive = dash.Tracking.Active
-		ac.StartedAt = dash.Tracking.StartedAt
-		ac.ChallengePending = dash.Tracking.ChallengePending
-		if dash.Hours.TodaySeconds > st.lastToday {
-			st.lastToday = dash.Hours.TodaySeconds
-			st.lastTodayAt = time.Now()
-			st.stalled = false
-		} else if st.keeper.IsRunning() && !st.lastTodayAt.IsZero() &&
-			time.Since(st.lastTodayAt) > 4*time.Minute {
-			st.stalled = true
-		}
-		ac.Stalled = st.stalled || st.keeper.Stalled()
-		if ac.QuotaTodaySeconds > 0 && dash.Hours.TodaySeconds >= ac.QuotaTodaySeconds {
-			ac.QuotaReached = true
-		}
-		m.recordDayActual(st, dash.Hours.TodaySeconds)
-		now := time.Now()
-		m.backfillPastDays(st, dash.Hours.TodaySeconds, dash.Hours.WeekSeconds, now)
-		if len(st.weekDays.Days) > 0 {
-			ac.WeekDaysActual = make(map[string]int, len(st.weekDays.Days))
-			for k, v := range st.weekDays.Days {
-				ac.WeekDaysActual[k] = v
+	if st.weekDaysDirty {
+		go func(st *accountState) {
+			m.mu.RLock()
+			cookies := m.readCookies(st)
+			m.mu.RUnlock()
+			if err := m.saveAccount(st, cookies); err != nil {
+				slog.Warn("save week days failed", "login", st.login, "error", err)
 			}
-		}
-		if st.weekDaysDirty {
-			go func(st *accountState) {
-				m.mu.RLock()
-				cookies := m.readCookies(st)
-				m.mu.RUnlock()
-				if err := m.saveAccount(st, cookies); err != nil {
-					slog.Warn("save week days failed", "login", st.login, "error", err)
-				}
-			}(st)
-		}
-	}
-	if ac.StartedAt == "" && st.keeper.IsRunning() {
-		if dash, err := st.client.Dashboard(); err == nil {
-			ac.StartedAt = dash.Tracking.StartedAt
-			ac.ChallengePending = dash.Tracking.ChallengePending
-		}
+		}(st)
 	}
 	return ac
 }

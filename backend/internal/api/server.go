@@ -103,11 +103,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"active":       s.accounts.RotationActive(),
 		"currentLogin": s.accounts.RotationLogin(),
 	}
-	active := s.accounts.Active()
+	accounts := s.accounts.List()
+	active := s.accounts.ActiveFrom(accounts)
 	if active == nil {
 		jsonOK(w, map[string]any{
 			"authenticated": false,
-			"accounts":      s.accounts.List(),
+			"accounts":      accounts,
 			"trackingMode":  s.accounts.Mode(),
 			"weekHours":     s.accounts.WeekHours(),
 			"rotation":      rotation,
@@ -133,7 +134,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			"startedAt":        active.StartedAt,
 			"challengePending": active.ChallengePending,
 		},
-		"accounts": s.accounts.List(),
+		"accounts": accounts,
 		"logFile":  logx.LogPath(s.dataDir),
 	})
 }
