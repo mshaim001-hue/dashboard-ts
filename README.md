@@ -1,5 +1,5 @@
 # ts-tracker
-
+make up
 Локальное приложение для учёта часов на [dashboard.tomorrow-school.ai](https://dashboard.tomorrow-school.ai) без открытого Chrome.
 
 Go backend шлёт heartbeat напрямую в API школы, решает captcha (macOS Vision), делает agent pair. React UI — вход, несколько аккаунтов, старт/стоп, логи.
